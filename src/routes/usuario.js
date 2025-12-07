@@ -53,10 +53,9 @@ router.post('/', async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Helpers só para este arquivo (se já tiver em outro lugar, pode reutilizar)
+/* Helpers só para este arquivo                                       */
 /* ------------------------------------------------------------------ */
 
-// Formata Date/Timestamp em "DD/MM/YYYY"
 function formatDateBR(date) {
   if (!date) return null;
   const d = new Date(date);
@@ -66,7 +65,6 @@ function formatDateBR(date) {
   return `${day}/${month}/${year}`;
 }
 
-// Formata preço a partir de centavos ou "Gratuito"
 function formatPrice(precoCentavos, gratuito) {
   if (gratuito) return 'Gratuito';
 
@@ -78,8 +76,8 @@ function formatPrice(precoCentavos, gratuito) {
 }
 
 /* ------------------------------------------------------------------ */
-/* NOVA ROTA: listar eventos em que o usuário está inscrito           */
 /* GET /usuarios/:id/eventos-inscritos                                */
+/* Lista eventos em que o usuário TEM inscrição ativa                 */
 /* ------------------------------------------------------------------ */
 
 router.get('/:id/eventos-inscritos', async (req, res) => {
@@ -98,10 +96,14 @@ router.get('/:id/eventos-inscritos', async (req, res) => {
         e.preco_centavos,
         e.gratuito,
         e.imagem_url,
-        COUNT(ue.id) AS inscritos
+        COALESCE(
+          COUNT(ue.id) FILTER (WHERE ue.status = 'inscrito'),
+          0
+        ) AS inscritos
       FROM usuario_eventos ue
       JOIN eventos e ON e.id = ue.evento_id
       WHERE ue.usuario_id = $1
+        AND ue.status    = 'inscrito'
       GROUP BY
         e.id,
         e.titulo,
