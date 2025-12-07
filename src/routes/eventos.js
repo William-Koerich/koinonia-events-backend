@@ -162,7 +162,10 @@ router.get('/', async (req, res) => {
         e.preco_centavos,
         e.gratuito,
         e.imagem_url,
-        COALESCE(COUNT(ue.id) FILTER (WHERE ue.status = 'inscrito'), 0) AS subscribers_count
+        COALESCE(
+          COUNT(ue.id) FILTER (WHERE ue.status = 'inscrito'),
+          0
+        ) AS subscribers_count
       FROM eventos e
       LEFT JOIN usuario_eventos ue
         ON ue.evento_id = e.id
@@ -209,12 +212,15 @@ router.get('/:id', async (req, res) => {
         e.preco_centavos,
         e.gratuito,
         e.imagem_url,
-        COALESCE(COUNT(ue.id) FILTER (WHERE ue.status = 'inscrito'), 0) AS subscribers_count
-      FROM eventos e
-      LEFT JOIN usuario_eventos ue
+        COALESCE(
+            COUNT(ue.id) FILTER (WHERE ue.status = 'inscrito'),
+            0
+        ) AS subscribers_count
+        FROM eventos e
+        LEFT JOIN usuario_eventos ue
         ON ue.evento_id = e.id
-      WHERE e.id = $1
-      GROUP BY e.id
+        GROUP BY e.id
+        ORDER BY e.data_evento ASC, e.id ASC;
       `,
       [id],
     );
@@ -246,11 +252,18 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// POST /eventos/:id/inscricoes
-// Vincula participantes (usuario + familiares) ao evento
+/* ------------------------------------------------------------------ */
+/* POST /eventos/:id/inscricoes  -> ADICIONAR NOVOS PARTICIPANTES     */
+/* NÃO apaga os antigos; só insere quem ainda não existe              */
+/* body: { usuarioId, participantes: [{ nome, idade }] }              */
+/* ------------------------------------------------------------------ */
 router.post('/:id/inscricoes', async (req, res) => {
-  const { id: eventoId } = req.params;
+  const eventoId = Number(req.params.id);
   const { usuarioId, participantes } = req.body;
+
+  if (!eventoId || Number.isNaN(eventoId)) {
+    return res.status(400).json({ error: 'ID do evento inválido' });
+  }
 
   if (!usuarioId || !Array.isArray(participantes) || participantes.length === 0) {
     return res.status(400).json({
@@ -283,7 +296,7 @@ router.post('/:id/inscricoes', async (req, res) => {
       return res.status(404).json({ error: 'Evento não encontrado' });
     }
 
-    // opcional: verifica se usuário existe
+    // verifica se usuário existe
     const usuarioResult = await client.query(
       'SELECT id FROM usuarios WHERE id = $1',
       [usuarioId],
@@ -293,21 +306,49 @@ router.post('/:id/inscricoes', async (req, res) => {
       return res.status(404).json({ error: 'Usuário não encontrado' });
     }
 
-    // regra: antes de inserir, remove inscrições anteriores desse usuário nesse evento
-    await client.query(
+    // busca participantes já inscritos desse usuário nesse evento
+    const existentesResult = await client.query(
       `
-      DELETE FROM usuario_eventos
-      WHERE usuario_id = $1 AND evento_id = $2
+      SELECT participante_nome, participante_idade
+      FROM usuario_eventos
+      WHERE usuario_id = $1
+        AND evento_id  = $2
+        AND status     = 'inscrito'
       `,
       [usuarioId, eventoId],
     );
 
-    // monta INSERT multi-linha
-    const values = [];
-    const params = [usuarioId, eventoId];
-    let idx = 3; // já usei $1 e $2 acima
+    const existentesSet = new Set(
+      existentesResult.rows.map((row) => {
+        const nome = row.participante_nome?.trim().toLowerCase() || '';
+        const idade = row.participante_idade ?? '';
+        return `${nome}|${idade}`;
+      }),
+    );
 
-    participantes.forEach((p) => {
+    // filtra apenas novos (nome+idade ainda não existentes)
+    const novosParticipantes = participantes.filter((p) => {
+      const nome = p.nome.trim().toLowerCase();
+      const idade = p.idade ?? '';
+      const key = `${nome}|${idade}`;
+      if (existentesSet.has(key)) return false;
+      existentesSet.add(key);
+      return true;
+    });
+
+    if (novosParticipantes.length === 0) {
+      await client.query('COMMIT');
+      return res.status(200).json({
+        message: 'Nenhum novo participante para adicionar',
+      });
+    }
+
+    // monta INSERT multi-linha só com os novos
+    const params = [usuarioId, eventoId];
+    const values = [];
+    let idx = 3;
+
+    novosParticipantes.forEach((p) => {
       values.push(`($1, $2, $${idx}, $${idx + 1}, 'inscrito')`);
       params.push(p.nome, p.idade || null);
       idx += 2;
@@ -335,8 +376,8 @@ router.post('/:id/inscricoes', async (req, res) => {
     await client.query('COMMIT');
 
     return res.status(201).json({
-      message: 'Inscrição realizada com sucesso',
-      eventoId: Number(eventoId),
+      message: 'Participantes adicionados com sucesso',
+      eventoId,
       usuarioId,
       participantes: insertResult.rows.map((row) => ({
         id: row.id,
@@ -354,6 +395,104 @@ router.post('/:id/inscricoes', async (req, res) => {
     });
   } finally {
     client.release();
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /eventos/:id/inscricoes/:usuarioId                             */
+/* devolve os participantes INSCRITOS daquele usuário nesse evento    */
+/* ------------------------------------------------------------------ */
+router.get('/:id/inscricoes/:usuarioId', async (req, res) => {
+  const eventoId  = Number(req.params.id);
+  const usuarioId = Number(req.params.usuarioId);
+
+  if (!eventoId || Number.isNaN(eventoId)) {
+    return res.status(400).json({ error: 'ID do evento inválido' });
+  }
+  if (!usuarioId || Number.isNaN(usuarioId)) {
+    return res.status(400).json({ error: 'ID do usuário inválido' });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        participante_nome,
+        participante_idade
+      FROM usuario_eventos
+      WHERE evento_id = $1
+        AND usuario_id = $2
+        AND status     = 'inscrito'
+      ORDER BY id ASC
+      `,
+      [eventoId, usuarioId],
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        error: 'Inscrição não encontrada para este usuário neste evento',
+      });
+    }
+
+    const participantes = result.rows.map((row) => ({
+      id: row.id,
+      nome: row.participante_nome,
+      idade: row.participante_idade,
+    }));
+
+    return res.json({
+      usuarioId,
+      eventoId,
+      participantes,
+    });
+  } catch (err) {
+    console.error('[GET /eventos/:id/inscricoes/:usuarioId] erro:', err);
+    return res.status(500).json({
+      error: 'Erro ao buscar inscrição',
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* DELETE /eventos/:id/inscricoes/:usuarioId -> cancelar inscrição    */
+/* marca status = 'cancelado' para TODOS participantes desse usuário  */
+/* ------------------------------------------------------------------ */
+router.delete('/:id/inscricoes/:usuarioId', async (req, res) => {
+  const eventoId  = Number(req.params.id);
+  const usuarioId = Number(req.params.usuarioId);
+
+  if (!eventoId || Number.isNaN(eventoId)) {
+    return res.status(400).json({ error: 'ID do evento inválido' });
+  }
+  if (!usuarioId || Number.isNaN(usuarioId)) {
+    return res.status(400).json({ error: 'ID do usuário inválido' });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE usuario_eventos
+      SET status = 'cancelado'
+      WHERE evento_id = $1
+        AND usuario_id = $2
+        AND status     = 'inscrito'
+      `,
+      [eventoId, usuarioId],
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        error: 'Nenhuma inscrição ativa encontrada para este usuário',
+      });
+    }
+
+    return res.json({ message: 'Inscrição cancelada com sucesso' });
+  } catch (err) {
+    console.error('[DELETE /eventos/:id/inscricoes/:usuarioId] erro:', err);
+    return res.status(500).json({
+      error: 'Erro ao cancelar inscrição',
+    });
   }
 });
 
